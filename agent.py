@@ -1,44 +1,110 @@
-#agent.py
-import zipfile
-import os
-import hashlib
-import requests
-from pathlib import Path
-import streamlit as st
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
-from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.llms import CustomLLM, LLMMetadata, CompletionResponse
-import logging
-from typing import List, Any, Generator, AsyncGenerator
+# final.py
+"""
+Unified Streamlit app with an AMD64-compatible embedding backend.
 
-# --------------------------------------------------------------
+This file merges the logic from:
+- main.py     (Streamlit + LlamaIndex orchestration)
+- embedder.py (MLX / ModernBERT embedding)
+
+and replaces the MLX-only embedder with a standard `sentence-transformers`
+embedder that runs on typical x86_64 / AMD64 machines (CPU or CUDA GPU).
+
+Requirements (add to requirements.txt if not already present):
+- sentence-transformers
+- torch (CPU or CUDA build)
+- llama-index-core
+- streamlit
+- requests
+"""
+
+from __future__ import annotations
+
+import os
+import zipfile
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any, AsyncGenerator, Generator, List
+
+import requests
+import streamlit as st
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
+from llama_index.core.embeddings import BaseEmbedding
+from llama_index.core.llms import CompletionResponse, CustomLLM, LLMMetadata
+
+# ---------------------------------------------------------------------
 # 1. SILENCE NOISY LOGS
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
 logging.getLogger("llama_index").setLevel(logging.CRITICAL)
 
-# --------------------------------------------------------------
-# 2. IMPORT FAST EMBEDDER (ModernBERT / MLX)
-# --------------------------------------------------------------
-from embedder import embedder  # <-- ModernBERT 4-bit local embedder
 
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 2. AMD64-COMPATIBLE EMBEDDER (SentenceTransformers)
+# ---------------------------------------------------------------------
+# We replace the MLX-only ModernBERT embedder with a cross-platform
+# sentence-transformers model. This works on Linux/Windows/macOS AMD64.
+#
+# The chosen default is `all-MiniLM-L6-v2` (768-dim, fast, widely used).
+# You can change MODEL_NAME below if you want a different embedding model.
+# ---------------------------------------------------------------------
+class LocalEmbedderAMD64:
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
+
+        self._model_name = model_name
+        st.write(f"Loading embedding model: `{model_name}`")
+        self._model = SentenceTransformer(model_name)
+        self._dim = self._model.get_sentence_embedding_dimension()
+        st.write(f"Embeddings ready (dim={self._dim}).")
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # `encode` already returns normalized embeddings if `normalize_embeddings=True`
+        embeddings = self._model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+
+
+# Global embedder instance
+_embedder = None
+
+
+def get_embedder() -> LocalEmbedderAMD64:
+    global _embedder
+    if _embedder is None:
+        _embedder = LocalEmbedderAMD64()
+    return _embedder
+
+
+# ---------------------------------------------------------------------
 # 3. LLAMA-INDEX EMBEDDING WRAPPER
-# --------------------------------------------------------------
-from llama_index.core.embeddings import BaseEmbedding
-
+# ---------------------------------------------------------------------
 class LlamaIndexWrapper(BaseEmbedding):
-    def __init__(self, dim: int = 768):
+    def __init__(self):
         super().__init__()
-        self._dimension = dim
+        self._local = get_embedder()
 
     def _get_query_embedding(self, query: str) -> List[float]:
-        return embedder.embed_query(query)
+        return self._local.embed_query(query)
 
     def _get_text_embedding(self, text: str) -> List[float]:
-        return embedder.embed_query(text)
+        return self._local.embed_query(text)
 
-    def _get_text_embedding_batch(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
-        return embedder.embed_documents(texts)
+    def _get_text_embedding_batch(
+        self, texts: List[str], **_: Any
+    ) -> List[List[float]]:
+        return self._local.embed_documents(texts)
 
     async def _aget_query_embedding(self, query: str) -> List[float]:
         return self._get_query_embedding(query)
@@ -46,27 +112,31 @@ class LlamaIndexWrapper(BaseEmbedding):
     async def _aget_text_embedding(self, text: str) -> List[float]:
         return self._get_text_embedding(text)
 
-    async def _aget_text_embedding_batch(self, texts: List[str], **kwargs: Any) -> List[List[float]]:
+    async def _aget_text_embedding_batch(
+        self, texts: List[str], **kwargs: Any
+    ) -> List[List[float]]:
         return self._get_text_embedding_batch(texts, **kwargs)
 
     @property
     def dimension(self) -> int:
-        return self._dimension
+        return self._local.dimension
 
 
-embed_model = LlamaIndexWrapper(dim=768)
+embed_model = LlamaIndexWrapper()
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 4. CONFIG
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
 TEMP_DIR = "temp_repo"
 OUTPUT_DIR = "output"
 LLM_API = os.getenv("OPENAI_API_BASE")
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 5. HELPER — convert any Response to string
-# --------------------------------------------------------------
-def to_text(resp):
+# ---------------------------------------------------------------------
+def to_text(resp: Any) -> str:
     """Convert LlamaIndex Response or string-like objects safely to text."""
     if resp is None:
         return ""
@@ -76,10 +146,11 @@ def to_text(resp):
         return resp.text
     return str(resp)
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 6. AUTO-DETECT MODEL FROM LM-STUDIO
-# --------------------------------------------------------------
-def get_lmstudio_model():
+# ---------------------------------------------------------------------
+def get_lmstudio_model() -> str:
     try:
         r = requests.get(f"{LLM_API}/models", timeout=5)
         if r.status_code == 200:
@@ -90,9 +161,10 @@ def get_lmstudio_model():
         st.warning(f"Auto-detect failed: {e}. Using default model.")
     return "openai/gpt-5.1"
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 7. CUSTOM LLM (LM-STUDIO API)
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
 class LMStudioLLM(CustomLLM):
     model_name: str
     temperature: float = 0.7
@@ -107,13 +179,16 @@ class LMStudioLLM(CustomLLM):
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=self.context_window, num_output=self.num_output)
+        return LLMMetadata(
+            context_window=self.context_window,
+            num_output=self.num_output,
+        )
 
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        
+
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -123,46 +198,62 @@ class LMStudioLLM(CustomLLM):
             **kwargs,
         }
         resp = requests.post(
-            f"{self.base_url}/chat/completions", 
-            json=payload, 
+            f"{self.base_url}/chat/completions",
+            json=payload,
             headers=headers,
-            timeout=300
+            timeout=300,
         )
         resp.raise_for_status()
-        text = resp.json()["choices"]["message"]["content"]
+        # NOTE: Some OpenAI-compatible servers return choices[0]["message"]["content"]
+        data = resp.json()
+        if isinstance(data.get("choices"), list):
+            # openai-compatible shape
+            text = data["choices"][0]["message"]["content"]
+        else:
+            # Fallback if the shape is slightly different
+            text = str(data)
         return CompletionResponse(text=text)
 
     async def acomplete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
         return self.complete(prompt, **kwargs)
 
-    def stream_complete(self, prompt: str, **kwargs: Any) -> Generator[CompletionResponse, None, None]:
+    def stream_complete(
+        self, prompt: str, **kwargs: Any
+    ) -> Generator[CompletionResponse, None, None]:
         yield self.complete(prompt, **kwargs)
 
-    async def astream_complete(self, prompt: str, **kwargs: Any) -> AsyncGenerator[CompletionResponse, None]:
+    async def astream_complete(
+        self, prompt: str, **kwargs: Any
+    ) -> AsyncGenerator[CompletionResponse, None]:
         yield self.complete(prompt, **kwargs)
 
 
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
 # 8. EXTRACT ZIP (clean old files first)
-# --------------------------------------------------------------
-def extract_repo(zip_path: str):
-    os.makedirs(TEMP_DIR, exist_ok=True)
+# ---------------------------------------------------------------------
+def extract_repo(zip_path: str) -> None:
     import shutil
+
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    # Clear existing contents
     for item in os.listdir(TEMP_DIR):
         p = os.path.join(TEMP_DIR, item)
         if os.path.isdir(p):
             shutil.rmtree(p)
         else:
             os.unlink(p)
+    # Extract new zip
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(TEMP_DIR)
     st.success(f"✅ Extracted → `{TEMP_DIR}`")
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 9. BUILD INDEX (NO CACHING)
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
 def build_index(_repo_hash: str):
     import shutil
+
     if not os.path.isdir(TEMP_DIR) or not os.listdir(TEMP_DIR):
         st.error("No files extracted!")
         return None
@@ -176,9 +267,22 @@ def build_index(_repo_hash: str):
         TEMP_DIR,
         recursive=True,
         exclude=[
-        "*.test.py", "*__pycache__*", "*.pyc", "*.log",
-        "*.mp3", "*.wav", "*.m4a", "*.mp4", "*.mov", "*.avi", "*.flac", "*.ogg",
-        "node_modules", ".git", ".venv", "*.md"
+            "*.test.py",
+            "*__pycache__*",
+            "*.pyc",
+            "*.log",
+            "*.mp3",
+            "*.wav",
+            "*.m4a",
+            "*.mp4",
+            "*.mov",
+            "*.avi",
+            "*.flac",
+            "*.ogg",
+            "node_modules",
+            ".git",
+            ".venv",
+            "*.md",
         ],
     ).load_data()
 
@@ -186,26 +290,35 @@ def build_index(_repo_hash: str):
         st.error("No documents loaded!")
         return None
 
+    from llama_index.core.node_parser import SentenceSplitter
+
     splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=50)
     nodes = splitter.get_nodes_from_documents(docs)
 
     index = VectorStoreIndex(nodes, embed_model=embed_model, embed_batch_size=32)
-    st.success("✅ Index built into Embeddings")
+    st.success("✅ Index built into embeddings")
     return index
 
-# --------------------------------------------------------------
+
+# ---------------------------------------------------------------------
 # 10. MAIN STREAMLIT APP
-# --------------------------------------------------------------
-def main():
+# ---------------------------------------------------------------------
+def main() -> None:
     st.title("🤖 AI Codebase → Docs Agent")
 
+    # Show which embedding model is in use
+    e = get_embedder()
+    st.info(f"Embedding backend: sentence-transformers ({e.dimension}-dim)")
+
     auto_detected = get_lmstudio_model()
-    st.info(f"**Auto-detected model:** `{auto_detected}`")
+    st.info(f"**Auto-detected LLM model:** `{auto_detected}`")
 
     available_models = [
         auto_detected,
     ]
-    selected_model = st.selectbox("Select LLM (loaded in LM-Studio)", available_models, index=0)
+    selected_model = st.selectbox(
+        "Select LLM ", available_models, index=0
+    )
     llm = LMStudioLLM(model_name=selected_model, temperature=0.7)
 
     uploaded = st.file_uploader("📦 Upload GitHub Repo (.zip)", type="zip")
@@ -231,42 +344,57 @@ def main():
 
         # === 1. Overview ===
         with st.expander("📘 1. Project Overview", expanded=True):
-            overview = to_text(engine.query(
-                "Analyze the codebase and summarize:\n"
-                "- Project name\n- Description\n- Tech stack\n- Entry point\n- Folder structure overview."
-            ))
+            overview = to_text(
+                engine.query(
+                    "Analyze the codebase and summarize:\n"
+                    "- Project name\n- Description\n- Tech stack\n"
+                    "- Entry point\n- Folder structure overview."
+                )
+            )
             st.markdown(overview)
             st.session_state.overview = overview
 
         # === 2. Generate README ===
         with st.expander("🧾 2. Generate README.md", expanded=True):
-            readme = to_text(engine.query(
-                f"Using this project overview:\n{st.session_state.overview}\n\n"
-                "Generate a **professional and structured README.md** including:\n"
-                "- # Title\n- ## Description\n- ## Features\n- ## Installation\n"
-                "- ## Usage\n- ## API Reference\n- ## Folder Structure (in ##Folder Structure section/block)\n- ## Contributing\n"
-                "- ## License\nEnsure Markdown syntax is perfect with spacing and headers."
-            ))
+            readme = to_text(
+                engine.query(
+                    "Using this project overview:\n"
+                    f"{st.session_state.overview}\n\n"
+                    "Generate a **professional and structured README.md** including:\n"
+                    "- # Title\n- ## Description\n- ## Features\n- ## Installation\n"
+                    "- ## Usage\n- ## API Reference\n"
+                    "- ## Folder Structure (in ##Folder Structure section/block)\n"
+                    "- ## Contributing\n- ## License\n"
+                    "Ensure Markdown syntax is perfect with spacing and headers."
+                )
+            )
             st.markdown(readme)
             st.session_state.readme = readme
 
         # === 3. Verification & Auto-Fix ===
         with st.expander("🔍 3. Self-Verification & Auto-Fix", expanded=True):
-            check = to_text(engine.query(
-                f"README:\n{st.session_state.readme}\n\n"
-                "Review ALL code files and verify the README accuracy.\n"
-                "Check for incorrect function/class names, wrong dependencies, or invalid setup steps.\n"
-                "If issues are found, summarize them clearly. Otherwise say 'ALL CORRECT'."
-            ))
+            check = to_text(
+                engine.query(
+                    f"README:\n{st.session_state.readme}\n\n"
+                    "Review ALL code files and verify the README accuracy.\n"
+                    "Check for incorrect function/class names, wrong dependencies, "
+                    "or invalid setup steps.\n"
+                    "If issues are found, summarize them clearly. Otherwise say 'ALL CORRECT'."
+                )
+            )
             st.markdown(check)
 
             if "all correct" not in check.lower():
                 st.warning("Fixing README automatically...")
-                fixed = to_text(engine.query(
-                    f"Fix and improve the README.md based on these verification results:\n{check}\n\n"
-                    f"Here is the original README:\n{st.session_state.readme}\n\n"
-                    "Ensure the final version is perfectly formatted Markdown, with consistent headings and spacing."
-                ))
+                fixed = to_text(
+                    engine.query(
+                        "Fix and improve the README.md based on these "
+                        f"verification results:\n{check}\n\n"
+                        f"Here is the original README:\n{st.session_state.readme}\n\n"
+                        "Ensure the final version is perfectly formatted Markdown, "
+                        "with consistent headings and spacing."
+                    )
+                )
                 st.success("✅ Fixed README generated!")
                 st.markdown("**Final README.md:**")
                 st.markdown(fixed)
@@ -277,16 +405,14 @@ def main():
 
         # === 4. Architecture Diagram ===
         with st.expander("🧩 4. Architecture Diagram", expanded=True):
-            diag = to_text(engine.query(
-                "Generate a **Mermaid** flowchart of the application architecture:\n"
-                "- Components and relationships\n- Data flow\n- APIs / Services / DB\n"
-                "Return only valid Markdown with ```mermaid code block."
-            ))
+            diag = to_text(
+                engine.query(
+                    "Generate a **Mermaid** flowchart of the application architecture:\n"
+                    "- Components and relationships\n- Data flow\n- APIs / Services / DB\n"
+                    "Return only valid Markdown with ```mermaid code block."
+                )
+            )
             st.code(diag, language="mermaid")
-
-
-
-
 
         # === 5. Export ===
         os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -297,10 +423,10 @@ def main():
         readme_original_path.write_text(st.session_state.readme)
         readme_fixed_path.write_text(st.session_state.readme_fixed)
         diagram_path.write_text(diag)
-        
+
         st.success(f"📁 Exported all files → `{OUTPUT_DIR}/`")
 
-        # --- 🪄 Download Buttons ---
+        # Download buttons
         st.markdown("### 📥 Download Your Files")
 
         with open(readme_fixed_path, "rb") as f:
@@ -327,9 +453,13 @@ def main():
                 mime="text/plain",
             )
 
-        st.info("✅ You can also find these files saved in the `output/` folder locally.")
+        st.info(
+            "✅ You can also find these files saved in the `output/` folder locally."
+        )
 
 
-# --------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 11. ENTRYPOINT
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     main()
