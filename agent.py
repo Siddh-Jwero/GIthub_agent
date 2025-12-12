@@ -61,7 +61,7 @@ embed_model = LlamaIndexWrapper(dim=768)
 # --------------------------------------------------------------
 TEMP_DIR = "temp_repo"
 OUTPUT_DIR = "output"
-LLM_API = "http://localhost:1234/v1"
+LLM_API = os.getenv("OPENAI_API_BASE")
 
 # --------------------------------------------------------------
 # 5. HELPER — convert any Response to string
@@ -88,7 +88,7 @@ def get_lmstudio_model():
                 return models[0]["id"]
     except Exception as e:
         st.warning(f"Auto-detect failed: {e}. Using default model.")
-    return "Qwen2.5-Coder-7B-Instruct"
+    return "openai/gpt-5.1"
 
 # --------------------------------------------------------------
 # 7. CUSTOM LLM (LM-STUDIO API)
@@ -102,13 +102,18 @@ class LMStudioLLM(CustomLLM):
 
     def __init__(self, model_name: str, temperature: float = 0.7):
         super().__init__(model_name=model_name, temperature=temperature)
-        self.base_url = "http://localhost:1234/v1"
+        self.base_url = os.getenv("OPENAI_API_BASE")
+        self.api_key = os.getenv("OPENAI_API_KEY")
 
     @property
     def metadata(self) -> LLMMetadata:
         return LLMMetadata(context_window=self.context_window, num_output=self.num_output)
 
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -117,9 +122,14 @@ class LMStudioLLM(CustomLLM):
             "stream": False,
             **kwargs,
         }
-        resp = requests.post(f"{self.base_url}/chat/completions", json=payload, timeout=300)
+        resp = requests.post(
+            f"{self.base_url}/chat/completions", 
+            json=payload, 
+            headers=headers,
+            timeout=300
+        )
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"]
+        text = resp.json()["choices"]["message"]["content"]
         return CompletionResponse(text=text)
 
     async def acomplete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
@@ -180,17 +190,17 @@ def build_index(_repo_hash: str):
     nodes = splitter.get_nodes_from_documents(docs)
 
     index = VectorStoreIndex(nodes, embed_model=embed_model, embed_batch_size=32)
-    st.success("✅ Index built fresh (no caching)!")
+    st.success("✅ Index built into Embeddings")
     return index
 
 # --------------------------------------------------------------
 # 10. MAIN STREAMLIT APP
 # --------------------------------------------------------------
 def main():
-    st.title("🤖 AI Codebase → Docs Agent (ModernBERT + LM-Studio)")
+    st.title("🤖 AI Codebase → Docs Agent")
 
     auto_detected = get_lmstudio_model()
-    st.info(f"**Auto-detected LM-Studio model:** `{auto_detected}`")
+    st.info(f"**Auto-detected model:** `{auto_detected}`")
 
     available_models = [
         auto_detected,
