@@ -1,0 +1,17 @@
+# Core UI & indexing
+streamlit
+llama-index
+llama-index-llms-openai
+faiss-cpu
+
+# Embedding fallback (PyTorch on MPS)
+sentence-transformers
+
+# PyTorch with Metal support (one line!)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.0
+torchvision==0.19.0
+torchaudio==2.4.0
+
+# MLX (for MLX‑native models)
+mlx-lm
