@@ -1,17 +1,12 @@
-# Core UI & indexing
 streamlit
-llama-index
-llama-index-llms-openai
-faiss-cpu
+requests
 
-# Embedding fallback (PyTorch on MPS)
+# LlamaIndex core
+llama-index-core
+
+# Embeddings (AMD64 compatible)
 sentence-transformers
+torch
 
-# PyTorch with Metal support (one line!)
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.0
-torchvision==0.19.0
-torchaudio==2.4.0
-
-# MLX (for MLX‑native models)
-mlx-lm
+# Optional: if you use OpenAI-compatible APIs directly elsewhere
+openai
